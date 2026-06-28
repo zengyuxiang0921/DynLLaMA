@@ -133,6 +133,9 @@ def token_generator(ds, render_fn, encode_fn):
             text = render_fn(ex)
             if not text:
                 continue
+            if not isinstance(text, str):
+                # some datasets store text as a list of strings
+                text = "\n".join(map(str, text)) if isinstance(text, list) else str(text)
             produced = True
             for t in encode_fn(text):
                 yield t
