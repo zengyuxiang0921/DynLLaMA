@@ -18,6 +18,15 @@ Tokenization modes:
     setting N_VOCAB=256 in ops.h.
   --tokenizer <name>: use a HuggingFace tokenizer; vocab_size is taken from it.
 
+Chat datasets:
+  --chat renders each example's message list (--messages-column, default
+  "messages") through a chat template before tokenizing. The template is the
+  tokenizer's own chat_template, or a custom Jinja string via --chat-template,
+  or a minimal "<|role|>\ncontent\n" fallback (used for byte-level / templateless
+  tokenizers). Example:
+    python train_hf.py --dataset HuggingFaceH4/ultrachat_200k --split train_sft \\
+        --tokenizer gpt2 --chat --steps 2000
+
 The architecture comes from model.py's ModelArgs (tiny by default, --config 4b
 for the full shape). vocab_size is overridden to match the tokenizer, so for a
 real C++ run the C++ demo constants must be bumped to match.
@@ -29,7 +38,6 @@ This differs from train.py, which trains a synthetic +1 task with no downloads
 from __future__ import annotations
 
 import argparse
-import itertools
 
 import torch
 import torch.nn.functional as F
@@ -37,26 +45,71 @@ import torch.nn.functional as F
 from model import DeepSeekV4, ModelArgs
 
 
-def build_encoder(tokenizer_name: str | None):
-    """Return (encode_fn, vocab_size). encode_fn maps str -> list[int]."""
-    if tokenizer_name is None:
-        # Byte-level: UTF-8 bytes, vocab fixed at 256, no external dependency.
-        def encode(text: str):
-            return list(text.encode("utf-8"))
-        return encode, 256
-
+def build_tokenizer(name: str | None):
+    """Load a HuggingFace tokenizer, or None for byte-level mode."""
+    if name is None:
+        return None
     try:
         from transformers import AutoTokenizer
     except ImportError as e:
         raise SystemExit(
             "--tokenizer needs 'transformers' (pip install transformers)") from e
+    return AutoTokenizer.from_pretrained(name)
 
-    tok = AutoTokenizer.from_pretrained(tokenizer_name)
+
+def build_encoder(tokenizer):
+    """Return (encode_fn, vocab_size). encode_fn maps str -> list[int]."""
+    if tokenizer is None:
+        # Byte-level: UTF-8 bytes, vocab fixed at 256, no external dependency.
+        def encode(text: str):
+            return list(text.encode("utf-8"))
+        return encode, 256
 
     def encode(text: str):
-        return tok.encode(text, add_special_tokens=False)
+        return tokenizer.encode(text, add_special_tokens=False)
 
-    return encode, len(tok)
+    return encode, len(tokenizer)
+
+
+def _fallback_chat_render(messages) -> str:
+    # Minimal chat format for byte-level / templateless tokenizers.
+    return "".join(f"<|{m['role']}|>\n{m['content']}\n" for m in messages)
+
+
+def build_renderer(tokenizer, chat: bool, text_column: str,
+                   messages_column: str, chat_template: str | None):
+    """Return render_fn mapping a dataset example -> str (or None to skip)."""
+    if not chat:
+        def render(ex):
+            return ex.get(text_column)
+        return render
+
+    # Chat mode: prefer the tokenizer's apply_chat_template; fall back to Jinja
+    # or the minimal built-in format so byte-level mode still works.
+    if tokenizer is not None and chat_template:
+        tokenizer.chat_template = chat_template
+    if tokenizer is not None and getattr(tokenizer, "chat_template", None):
+        def render(ex):
+            msgs = ex.get(messages_column)
+            if not msgs:
+                return None
+            return tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=False)
+        return render
+
+    if chat_template:
+        from jinja2 import Template
+        tmpl = Template(chat_template)
+
+        def render(ex):
+            msgs = ex.get(messages_column)
+            return tmpl.render(messages=msgs) if msgs else None
+        return render
+
+    def render(ex):
+        msgs = ex.get(messages_column)
+        return _fallback_chat_render(msgs) if msgs else None
+    return render
 
 
 def open_stream(name: str, config: str | None, split: str, shuffle_buffer: int, seed: int):
@@ -72,12 +125,12 @@ def open_stream(name: str, config: str | None, split: str, shuffle_buffer: int, 
     return ds
 
 
-def token_generator(ds, encode_fn, text_column: str):
+def token_generator(ds, render_fn, encode_fn):
     """Yield a flat, infinite stream of token ids (re-streams the split on exhaust)."""
     while True:
         produced = False
         for ex in ds:
-            text = ex.get(text_column)
+            text = render_fn(ex)
             if not text:
                 continue
             produced = True
@@ -85,7 +138,7 @@ def token_generator(ds, encode_fn, text_column: str):
                 yield t
         if not produced:
             raise SystemExit(
-                f"no text found in column '{text_column}'; set --text-column")
+                "no usable text produced; check --text-column / --messages-column / --chat")
 
 
 def batch_generator(token_gen, batch: int, seqlen: int, device):
@@ -111,6 +164,13 @@ def main() -> None:
                     help="streaming shuffle buffer (0 to disable)")
     ap.add_argument("--tokenizer", default=None,
                     help="HF tokenizer name; omit for byte-level (vocab=256)")
+    # chat formatting
+    ap.add_argument("--chat", action="store_true",
+                    help="render each example's message list via a chat template")
+    ap.add_argument("--messages-column", default="messages",
+                    help="column holding the chat message list (with --chat)")
+    ap.add_argument("--chat-template", default=None,
+                    help="custom Jinja chat template (overrides tokenizer's own)")
     # model / optim
     ap.add_argument("--out", default="dsv4.pt", help="checkpoint output path")
     ap.add_argument("--config", choices=("tiny", "4b"), default="tiny")
@@ -130,7 +190,14 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    encode_fn, vocab = build_encoder(args.tokenizer)
+    if args.chat and args.tokenizer is None and args.chat_template is None:
+        print("note: --chat without --tokenizer/--chat-template uses the minimal "
+              "<|role|>\\ncontent\\n fallback format")
+
+    tokenizer = build_tokenizer(args.tokenizer)
+    encode_fn, vocab = build_encoder(tokenizer)
+    render_fn = build_renderer(tokenizer, args.chat, args.text_column,
+                               args.messages_column, args.chat_template)
     cfg = ModelArgs.tiny() if args.config == "tiny" else ModelArgs()
     cfg.vocab_size = vocab                     # match the tokenizer
     if args.seqlen > cfg.max_seq_len:
@@ -138,11 +205,11 @@ def main() -> None:
 
     model = DeepSeekV4(cfg).to(device).train()
     print(f"config={args.config}  vocab={vocab}  params={model.num_params()/1e6:.1f}M  device={device}")
-    print(f"streaming dataset={args.dataset} config={args.dataset_config} split={args.split}")
+    print(f"streaming dataset={args.dataset} config={args.dataset_config} split={args.split} chat={args.chat}")
 
     ds = open_stream(args.dataset, args.dataset_config, args.split, args.shuffle_buffer, args.seed)
     batches = batch_generator(
-        token_generator(ds, encode_fn, args.text_column), args.batch, args.seqlen, device)
+        token_generator(ds, render_fn, encode_fn), args.batch, args.seqlen, device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             betas=(0.9, 0.95), weight_decay=args.weight_decay)
