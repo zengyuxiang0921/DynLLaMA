@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "dynllama/context.h"   // dynllama_context_state, dynllama_ctx_init
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -402,9 +403,34 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // DynLLaMA: if the GGUF has embedded model code, JIT-compile and load it.
+    if (!model.path.empty()) {
+        static const std::string FILE_PFX = "dynllama.model_code.file.";
+        std::vector<std::pair<std::string,std::string>> files;
+        for (const auto & kv : model.gguf_kv) {
+            if (kv.first.size() > FILE_PFX.size() &&
+                kv.first.compare(0, FILE_PFX.size(), FILE_PFX) == 0 &&
+                !kv.second.empty()) {
+                files.push_back({kv.first.substr(FILE_PFX.size()), kv.second});
+            }
+        }
+        if (!files.empty()) {
+            dynllama_ = dynllama_ctx_init(files, model.arch_name(),
+                                          model.path, (int) cparams.n_ctx, __func__);
+        } else {
+            const auto it = model.gguf_kv.find("dynllama.model_code.source");
+            if (it != model.gguf_kv.end() && !it->second.empty()) {
+                dynllama_ = dynllama_ctx_init_single(it->second, model.arch_name(),
+                                                     model.path, (int) cparams.n_ctx, __func__);
+            }
+        }
+    }
 }
 
 llama_context::~llama_context() {
+    delete dynllama_;
+    dynllama_ = nullptr;
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1641,6 +1667,72 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// ---------------------------------------------------------------------------
+// DynLLaMA decode: call JIT-compiled eval, write logits to context buffer.
+// ---------------------------------------------------------------------------
+int llama_context::dynllama_decode_impl(const llama_batch & batch) {
+    if (!batch.token) {
+        LLAMA_LOG_ERROR("%s: dynllama requires token-based batch (no embedding input)\n", __func__);
+        return -1;
+    }
+
+    const int   n_tokens = batch.n_tokens;
+    const int   n_vocab  = (int) model.vocab.n_tokens();
+    const auto & hp      = dynllama_->model.hp;
+
+    // n_past = leftmost position in the batch (start of KV insertion)
+    int n_past = 0;
+    if (batch.pos) {
+        n_past = (int) batch.pos[0];
+        for (int i = 1; i < n_tokens; i++) {
+            if ((int) batch.pos[i] < n_past) n_past = (int) batch.pos[i];
+        }
+    }
+
+    // run dynllama_eval with KV cache
+    dynllama_->tmp_logits.resize((size_t) n_tokens * n_vocab);
+    auto c = dynllama::host_make_ctx(dynllama_->model,
+                                     batch.token, n_tokens, n_past,
+                                     dynllama_->tmp_logits.data(), /*use_kv=*/true);
+    dynllama_->jit.eval(&c);
+
+    // count requested outputs (tokens with logits[i] != 0, or all if null)
+    n_outputs = 0;
+    output_ids.resize(n_tokens);
+    for (int i = 0; i < n_tokens; i++) {
+        if (!batch.logits || batch.logits[i]) {
+            output_ids[i] = (int32_t) n_outputs++;
+        } else {
+            output_ids[i] = -1;
+        }
+    }
+
+    // ensure the host-side logits buffer is large enough
+    output_reserve((int32_t) n_outputs);
+
+    // copy requested logit rows into context logits buffer
+    if (logits.data && n_outputs > 0) {
+        for (int i = 0; i < n_tokens; i++) {
+            if (output_ids[i] >= 0) {
+                std::memcpy(logits.data + (size_t) output_ids[i] * n_vocab,
+                            dynllama_->tmp_logits.data() + (size_t) i * n_vocab,
+                            (size_t) n_vocab * sizeof(float));
+            }
+        }
+    }
+
+    // perf bookkeeping
+    if (t_compute_start_us == 0) {
+        t_compute_start_us = ggml_time_us();
+    }
+    n_queued_tokens += n_tokens;
+    has_evaluated_once = true;
+    if (n_tokens > 1) { n_p_eval += n_tokens; } else { n_eval++; }
+
+    (void) hp;
+    return 0;
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -1654,6 +1746,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
+    }
+
+    // DynLLaMA path: bypass ggml graph and use JIT-compiled eval.
+    if (dynllama_) {
+        return dynllama_decode_impl(batch_inp);
     }
 
     const auto & vocab   = model.vocab;

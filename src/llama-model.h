@@ -524,6 +524,7 @@ struct llama_model {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
     std::string name = "n/a";
+    std::string path;  // primary file path, set by llama_model_load
 
     llama_hparams hparams = {};
     llama_vocab   vocab;

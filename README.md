@@ -1,3 +1,7 @@
+DynLLaMA is a fork from llama.cpp to add dynamic JIT compile in gguf
+This project is unstable, **DO NOT DEPLOY**
+Contact author's email zyx_2012@outlook.com
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)

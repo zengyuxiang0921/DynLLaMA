@@ -362,6 +362,13 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // DynLLaMA: non-null when the GGUF has dynllama.model_code.source
+    // (full type defined in dynllama/context.h, included only in llama-context.cpp)
+    struct dynllama_context_state * dynllama_ = nullptr;
+
+    // Called from decode() when dynllama_ is active; bypasses the ggml graph.
+    int dynllama_decode_impl(const llama_batch & batch);
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

@@ -426,11 +426,11 @@ struct llama_model_mellum : public llama_model_base {
 
 
 //
-// llmpp -- alias for llama. Reuses all llama tensor layout and graph building.
-// Converted models (via convert_gguf_to_llmpp.py) use this architecture.
+// dynllama -- alias for llama. Reuses all llama tensor layout and graph building.
+// Converted models (via convert_gguf_to_dynllama.py) use this architecture.
 //
-struct llama_model_llmpp : public llama_model_llama {
-    llama_model_llmpp(const struct llama_model_params & params) : llama_model_llama(params) {}
+struct llama_model_dynllama : public llama_model_llama {
+    llama_model_dynllama(const struct llama_model_params & params) : llama_model_llama(params) {}
     // inherit load_arch_hparams, load_arch_tensors, build_arch_graph from llama_model_llama
 };
 

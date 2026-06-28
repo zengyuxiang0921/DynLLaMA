@@ -83,8 +83,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_stablelm(params);
         case LLM_ARCH_MELLUM:
             return new llama_model_mellum(params);
-        case LLM_ARCH_LLMPP:
-            return new llama_model_llmpp(params);
+        case LLM_ARCH_DYNLLAMA:
+            return new llama_model_dynllama(params);
         case LLM_ARCH_QWEN:
             return new llama_model_qwen(params);
         case LLM_ARCH_QWEN2:
@@ -2379,7 +2379,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
         case LLM_ARCH_LLAMA:
-        case LLM_ARCH_LLMPP:
+        case LLM_ARCH_DYNLLAMA:
         case LLM_ARCH_LLADA:
         case LLM_ARCH_LLAMA4:
         case LLM_ARCH_DECI:
