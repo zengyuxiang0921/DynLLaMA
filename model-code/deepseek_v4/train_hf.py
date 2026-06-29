@@ -184,6 +184,9 @@ def main() -> None:
     ap.add_argument("--weight-decay", type=float, default=0.1)
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--warmup", type=int, default=100)
+    ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="fp32",
+                    help="autocast dtype on CUDA; fp16/bf16 cut activation memory "
+                         "(weights + AdamW state stay fp32)")
     ap.add_argument("--save-every", type=int, default=0,
                     help="checkpoint every N steps (0 = only at end)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -217,6 +220,15 @@ def main() -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             betas=(0.9, 0.95), weight_decay=args.weight_decay)
 
+    # Mixed precision: autocast the forward/loss; fp16 needs loss scaling to
+    # avoid gradient underflow, bf16 does not. Only active on CUDA.
+    amp_dtype = {"fp32": None, "fp16": torch.float16,
+                 "bf16": torch.bfloat16}[args.precision]
+    use_amp = amp_dtype is not None and device.type == "cuda"
+    if amp_dtype is not None and device.type != "cuda":
+        print("note: --precision only autocasts on CUDA; running fp32 on", device.type)
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.precision == "fp16" and use_amp))
+
     def lr_at(step: int) -> float:
         if step < args.warmup:
             return step / max(1, args.warmup)
@@ -226,15 +238,18 @@ def main() -> None:
     for step in range(1, args.steps + 1):
         seq = next(batches)
         inp, tgt = seq[:, :-1], seq[:, 1:]
-        logits = model(inp)
-        loss = F.cross_entropy(logits.reshape(-1, vocab), tgt.reshape(-1))
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            logits = model(inp)
+            loss = F.cross_entropy(logits.reshape(-1, vocab), tgt.reshape(-1))
 
         for g in opt.param_groups:
             g["lr"] = args.lr * lr_at(step)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)                       # unscale before clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        opt.step()
+        scaler.step(opt)
+        scaler.update()
 
         if step == 1 or step % 25 == 0 or step == args.steps:
             print(f"step {step:5d}  loss {loss.item():.4f}  lr {opt.param_groups[0]['lr']:.2e}")

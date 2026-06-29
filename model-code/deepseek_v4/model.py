@@ -61,8 +61,11 @@ class ModelArgs:
     index_n_heads: int = 16
     index_head_dim: int = 128
     index_topk: int = 512
-    # MoE
-    n_routed_experts: int = 64
+    # feed-forward: n_routed_experts == 0 -> dense SwiGLU MLP (dense_inter_dim);
+    # n_routed_experts > 0 -> MoE. The 4B-class default below is dense.
+    dense_inter_dim: int = 18048
+    # MoE (only used when n_routed_experts > 0; e.g. the tiny preset)
+    n_routed_experts: int = 0
     n_activated_experts: int = 6
     n_shared_experts: int = 1
     moe_inter_dim: int = 1024
@@ -383,6 +386,26 @@ class Attention(nn.Module):
         return self.wo_b(og)
 
 
+# ---- feed-forward -----------------------------------------------------------
+class DenseFFN(nn.Module):
+    """Dense SwiGLU MLP. Drop-in replacement for MoE, used when
+    n_routed_experts == 0 (the 4B-class default)."""
+    def __init__(self, args: "ModelArgs"):
+        super().__init__()
+        self.w1 = nn.Linear(args.dim, args.dense_inter_dim, bias=False)   # gate
+        self.w3 = nn.Linear(args.dim, args.dense_inter_dim, bias=False)   # up
+        self.w2 = nn.Linear(args.dense_inter_dim, args.dim, bias=False)   # down
+        self.limit = args.swiglu_limit
+
+    def forward(self, x):
+        gate = self.w1(x)
+        up = self.w3(x)
+        if self.limit > 0:
+            gate = gate.clamp(max=self.limit)
+            up = up.clamp(-self.limit, self.limit)
+        return self.w2(F.silu(gate) * up)
+
+
 # ---- MoE --------------------------------------------------------------------
 class Expert(nn.Module):
     def __init__(self, dim, inter, limit):
@@ -440,7 +463,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm(args.dim, args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, args.norm_eps)
         self.attn = Attention(layer_id, args)
-        self.ffn = MoE(args)
+        self.ffn = MoE(args) if args.n_routed_experts > 0 else DenseFFN(args)
         self.hc_attn = HyperConn(args)
         self.hc_ffn = HyperConn(args)
 
@@ -531,6 +554,8 @@ if __name__ == "__main__":
     print("hybrid logits:", tuple(lh.shape), "finite:", bool(torch.isfinite(lh).all()))
 
     full = ModelArgs()
-    print(f"4B-class config: {full.n_layers} layers, dim={full.dim}, "
-          f"{full.n_routed_experts} experts (top-{full.n_activated_experts}), "
-          f"vocab={full.vocab_size}")
+    fm = DeepSeekV4(full).to("meta")
+    ffn = (f"{full.n_routed_experts} experts (top-{full.n_activated_experts})"
+           if full.n_routed_experts > 0 else f"dense FFN (inter={full.dense_inter_dim})")
+    print(f"4B-class config: {full.n_layers} layers, dim={full.dim}, {ffn}, "
+          f"vocab={full.vocab_size}, params={fm.num_params()/1e9:.3f}B")
